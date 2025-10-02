@@ -41,7 +41,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
         {
           'id': '1',
           'name': 'Madhurya Telang',
-          'status': 'Team Lead',
+          'status': 'Frontend Engineer',
           'isOnline': true,
           'mobile': '+91 9016333960',
           'email': '23ituoz133@ddu.ac.in',
@@ -50,7 +50,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
         {
           'id': '2',
           'name': 'Krish Thakker',
-          'status': 'AWS',
+          'status': 'Security Engineer',
           'isOnline': true,
           'mobile': '+91 9429984468',
           'email': '23ituos134@ddu.ac.in',
@@ -59,7 +59,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
         {
           'id': '3',
           'name': 'Shyam Kundalia',
-          'status': 'Designer',
+          'status': 'QA Testing',
           'isOnline': false,
           'mobile': '+91 9510747350',
           'email': '23ituoz125@ddu.ac.in',
@@ -68,7 +68,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
         {
           'id': '4',
           'name': 'Sarthak Tandel',
-          'status': 'Backend Developer',
+          'status': 'Backend Integration Specialist',
           'isOnline': true,
           'mobile': '+91 8140046213',
           'email': '23ituos131@ddu.ac.in',
@@ -77,7 +77,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
         {
           'id': '5',
           'name': 'Garima Chotai',
-          'status': 'QA Engineer',
+          'status': 'DevOps Engineer',
           'isOnline': true,
           'mobile': '+91 9054286490',
           'email': '23ituoz017@ddu.ac.in',
