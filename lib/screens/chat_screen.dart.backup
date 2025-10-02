@@ -1,0 +1,1767 @@
+import 'package:flutter/material.dart';
+// Removed unused import
+// Removed unused import
+import 'package:provider/provider.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/services.dart'; // Add this for HapticFeedback
+import 'dart:async'; // Add this for Timer
+
+import '../theme/app_theme.dart';
+import '../widgets/animated_widgets.dart';
+import '../services/auth_service.dart';
+import '../services/chat_service.dart';
+import '../services/vpn_service.dart';
+import '../widgets/chat_bubble.dart';
+import '../widgets/session_status_widget.dart';
+// Error banner removed
+import 'file_viewer_screen.dart'; // Add file viewer screen
+import 'contact_info_screen.dart'; // Add contact info screen
+
+class ChatScreen extends StatefulWidget {
+  final String? recipientId;
+  final String? recipientName;
+
+  const ChatScreen({super.key, this.recipientId, this.recipientName});
+
+  @override
+  State<ChatScreen> createState() => _ChatScreenState();
+}
+
+class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
+  final _messageController = TextEditingController();
+  final _scrollController = ScrollController();
+  final _searchController = TextEditingController();
+
+  late AnimationController _animationController;
+  late Animation<double> _fadeAnimation;
+  late Animation<Offset> _slideAnimation;
+
+  // ✅ Cache providers to avoid context issues in dispose
+  ChatService? _chatService;
+  AuthService? _authService;
+
+  bool _isSearching = false;
+  bool _isTyping = false;
+  List<Map<String, dynamic>> _searchResults = [];
+  List<Map<String, dynamic>> _messages = [];
+  String? _selectedRecipientId;
+  String? _selectedRecipientName;
+  bool _showFilePicker = false;
+
+  // Add multi-select functionality
+  bool _isMultiSelectMode = false;
+  final Set<String> _selectedMessages = <String>{};
+
+  // Track read messages to avoid duplicate read notifications
+  final Set<String> _readMessages = <String>{};
+
+  // Pagination
+  int _currentPage = 0;
+  bool _isLoadingMore = false;
+  bool _hasMoreMessages = true;
+
+  // Add debouncing for search
+  Timer? _searchDebounceTimer;
+  Timer? _typingDebounceTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedRecipientId = widget.recipientId;
+    _selectedRecipientName = widget.recipientName;
+    _setupAnimations();
+
+    // Initialize services first, then load messages
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _initializeServices();
+    });
+
+    // Add listener for scroll events to implement infinite scrolling
+    _scrollController.addListener(_scrollListener);
+  }
+
+  void _scrollListener() {
+    // Check if user has scrolled to the top to load more messages
+    if (_scrollController.position.pixels ==
+            _scrollController.position.maxScrollExtent &&
+        _hasMoreMessages &&
+        !_isLoadingMore) {
+      _loadMoreMessages();
+    }
+  }
+
+  Future<void> _loadMoreMessages() async {
+    if (_selectedRecipientId == null || _chatService == null) return;
+
+    setState(() {
+      _isLoadingMore = true;
+    });
+
+    try {
+      final moreMessages = await _chatService!
+          .getMessages(_selectedRecipientId!, page: ++_currentPage);
+
+      if (moreMessages.isEmpty) {
+        setState(() {
+          _hasMoreMessages = false;
+          _isLoadingMore = false;
+        });
+        return;
+      }
+
+      setState(() {
+        // Add new messages to the beginning of the list (older messages)
+        _messages.insertAll(0, moreMessages);
+        _isLoadingMore = false;
+      });
+    } catch (e) {
+      setState(() {
+        _isLoadingMore = false;
+      });
+      _showErrorSnackBar('Failed to load more messages: ${e.toString()}');
+    }
+  }
+
+  void _initializeServices() {
+    try {
+      // ✅ Cache providers
+      _chatService = Provider.of<ChatService>(context, listen: false);
+      _authService = Provider.of<AuthService>(context, listen: false);
+
+      if (_chatService != null && _authService != null) {
+        _chatService!.addListener(_handleChatServiceUpdate);
+        _chatService!
+            .setAuthService(_authService!); // Set auth service reference
+
+        // Ensure chat service is initialized with current VPN status
+        if (_authService!.authToken != null) {
+          // Get current VPN status and set it in chat service
+          final vpnService = Provider.of<VpnService>(context, listen: false);
+          _chatService!.setVpnStatus(vpnService.isConnected);
+          _chatService!.initialize(_authService!.authToken!);
+        }
+
+        // Load messages after services are initialized
+        _loadMessages();
+      }
+    } catch (e) {
+      debugPrint('Error initializing chat service in chat screen: $e');
+      if (mounted) {
+        _showErrorSnackBar(
+            'Failed to initialize chat service: ${e.toString()}');
+      }
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // ✅ Cache providers in didChangeDependencies as fallback
+    _chatService ??= Provider.of<ChatService>(context, listen: false);
+    _authService ??= Provider.of<AuthService>(context, listen: false);
+  }
+
+  void _setupAnimations() {
+    _animationController = AnimationController(
+      duration: const Duration(milliseconds: 800),
+      vsync: this,
+    );
+
+    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _animationController, curve: Curves.easeOut),
+    );
+
+    _slideAnimation =
+        Tween<Offset>(begin: const Offset(0, 0.1), end: Offset.zero).animate(
+      CurvedAnimation(
+        parent: _animationController,
+        curve: Curves.easeOutCubic,
+      ),
+    );
+
+    _animationController.forward();
+  }
+
+  Future<void> _loadMessages() async {
+    if (_selectedRecipientId == null) return;
+
+    try {
+      // Reset pagination
+      _currentPage = 0;
+      _hasMoreMessages = true;
+
+      // ✅ Use cached service with proper null safety
+      if (_chatService != null) {
+        final messages = await _chatService!.getMessages(_selectedRecipientId!);
+
+        if (mounted) {
+          setState(() {
+            _messages = messages;
+          });
+
+          // Scroll to last unread message instead of always scrolling to bottom
+          _scrollToLastUnreadMessage();
+        }
+      }
+    } catch (e) {
+      // ✅ Fix: Use addPostFrameCallback to ensure context is ready
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _showErrorSnackBar('Failed to load messages: ${e.toString()}');
+        }
+      });
+    }
+  }
+
+  // Add debounced search function
+  Future<void> _debouncedSearchUsers(String query) async {
+    // Cancel previous timer if exists
+    _searchDebounceTimer?.cancel();
+
+    // Set a new timer with 300ms delay
+    _searchDebounceTimer = Timer(const Duration(milliseconds: 300), () {
+      _searchUsers(query);
+    });
+  }
+
+  Future<void> _searchUsers(String query) async {
+    if (query.length < 2) {
+      setState(() {
+        _searchResults = [];
+      });
+      return;
+    }
+
+    try {
+      // ✅ Use cached service
+      final results = await _authService!.searchUsers(query);
+
+      setState(() {
+        _searchResults = results;
+      });
+    } catch (e) {
+      // ✅ Fix: Use addPostFrameCallback to ensure context is ready
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _showErrorSnackBar('Search failed: ${e.toString()}');
+        }
+      });
+    }
+  }
+
+  void _handleChatServiceUpdate() {
+    debugPrint('Chat service update received');
+
+    // ✅ Use cached service and add null safety
+    if (_chatService == null) {
+      debugPrint('Chat service is null, skipping update');
+      return;
+    }
+
+    // Update messages list when chat service updates - only append new messages
+    if (_selectedRecipientId != null) {
+      // Get the latest messages for this conversation
+      final conversationMessages =
+          _chatService!.conversationMessages[_selectedRecipientId];
+      if (conversationMessages != null) {
+        // Check if we have new messages to append
+        final currentMessageCount = _messages.length;
+        final newMessageCount = conversationMessages.length;
+
+        if (newMessageCount > currentMessageCount) {
+          // We have new messages, append only the new ones
+          final newMessages = conversationMessages.sublist(currentMessageCount);
+          setState(() {
+            _messages.addAll(newMessages);
+          });
+          // Scroll to bottom only when new messages are added
+          _scrollToBottom();
+        } else if (newMessageCount < currentMessageCount) {
+          // Messages were deleted, refresh the entire list
+          setState(() {
+            _messages = List<Map<String, dynamic>>.from(conversationMessages);
+          });
+        } else {
+          // Same count, but messages might have been updated (e.g., delivery status)
+          // Check if any messages have changed
+          bool messagesChanged = false;
+          for (int i = 0; i < currentMessageCount; i++) {
+            final currentMsg = _messages[i];
+            final newMsg = conversationMessages[i];
+
+            // Compare key fields that might change
+            if (currentMsg['deliveryStatus'] != newMsg['deliveryStatus'] ||
+                currentMsg['id'] != newMsg['id'] ||
+                currentMsg['tempId'] != newMsg['tempId']) {
+              messagesChanged = true;
+              break;
+            }
+          }
+
+          if (messagesChanged) {
+            setState(() {
+              _messages = List<Map<String, dynamic>>.from(conversationMessages);
+            });
+          }
+        }
+      }
+    } else {
+      // If no recipient selected, update all messages
+      debugPrint(
+        'Updating all messages, count: ${_chatService!.messages.length}',
+      );
+      setState(() {
+        _messages = List<Map<String, dynamic>>.from(_chatService!.messages);
+      });
+    }
+  }
+
+  Future<void> _sendMessage() async {
+    if (_messageController.text.trim().isEmpty ||
+        _selectedRecipientId == null) {
+      return;
+    }
+
+    final messageText = _messageController.text.trim();
+    _messageController.clear();
+
+    try {
+      // ✅ Use cached service
+      await _chatService!.sendMessage(
+        recipientId: _selectedRecipientId!,
+        message: messageText,
+      );
+
+      // Message will be added to the list by the chat service
+      _scrollToBottom();
+    } catch (e) {
+      // ✅ Fix: Use addPostFrameCallback to ensure context is ready
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _showErrorSnackBar('Failed to send message: ${e.toString()}');
+        }
+      });
+    }
+  }
+
+  void _selectUser(Map<String, dynamic> user) {
+    setState(() {
+      _selectedRecipientId = user['id'];
+      _selectedRecipientName = user['name'];
+      _isSearching = false;
+      _searchController.clear();
+      _searchResults = [];
+    });
+
+    _loadMessages();
+  }
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients) {
+        // Use animateTo with a small delay to ensure the layout is complete
+        Future.delayed(const Duration(milliseconds: 100), () {
+          if (_scrollController.hasClients) {
+            try {
+              _scrollController.animateTo(
+                _scrollController.position.maxScrollExtent,
+                duration: const Duration(milliseconds: 300),
+                curve: Curves.easeOut,
+              );
+            } catch (e) {
+              debugPrint('Error scrolling to bottom: $e');
+            }
+          }
+        });
+      }
+    });
+  }
+
+  /// Scroll to last unread message
+  void _scrollToLastUnreadMessage() {
+    if (_selectedRecipientId == null || _chatService == null) return;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients) {
+        // Use a small delay to ensure the layout is complete
+        Future.delayed(const Duration(milliseconds: 100), () async {
+          if (_scrollController.hasClients) {
+            try {
+              // Get index of last unread message
+              final unreadIndex = _chatService!
+                  .getLastUnreadMessageIndex(_selectedRecipientId!);
+
+              if (unreadIndex >= 0 && unreadIndex < _messages.length) {
+                // Calculate scroll position based on message index
+                // This is a simplified approach - in a real implementation, you might want to
+                // calculate the exact pixel position based on message heights
+                final scrollPosition =
+                    (_scrollController.position.maxScrollExtent *
+                        unreadIndex /
+                        _messages.length);
+
+                _scrollController.animateTo(
+                  scrollPosition,
+                  duration: const Duration(milliseconds: 300),
+                  curve: Curves.easeOut,
+                );
+
+                debugPrint(
+                    'Scrolled to last unread message at index: $unreadIndex');
+              } else {
+                // No unread messages, scroll to bottom
+                _scrollController.animateTo(
+                  _scrollController.position.maxScrollExtent,
+                  duration: const Duration(milliseconds: 300),
+                  curve: Curves.easeOut,
+                );
+
+                debugPrint('No unread messages, scrolled to bottom');
+              }
+            } catch (e) {
+              debugPrint('Error scrolling to last unread message: $e');
+              // Fallback to scrolling to bottom
+              _scrollToBottom();
+            }
+          }
+        });
+      }
+    });
+  }
+
+  void _showErrorSnackBar(String message) {
+    // Remove all error banners and just log to console
+    debugPrint('Error: $message');
+  }
+
+  @override
+  void dispose() {
+    // Remove the conversation cache clearing when leaving chat
+    // This was causing messages to not be visible when reopening chat
+
+    // ✅ Remove listener using cached service
+    _chatService?.removeListener(_handleChatServiceUpdate);
+    _scrollController.removeListener(_scrollListener);
+
+    // Cancel timers
+    _searchDebounceTimer?.cancel();
+    _typingDebounceTimer?.cancel();
+
+    _animationController.dispose();
+    _messageController.dispose();
+    _scrollController.dispose();
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SessionStatusWidget(
+      child: Scaffold(
+        resizeToAvoidBottomInset: true, // Add this to handle keyboard properly
+        body: Container(
+          decoration: const BoxDecoration(
+            gradient: AppTheme.backgroundGradient,
+          ),
+          child: Column(
+            children: [
+              _buildAppBar(),
+              if (_isSearching) _buildSearchSection(),
+              Expanded(
+                child: _selectedRecipientId == null
+                    ? _buildWelcomeView()
+                    : _buildChatView(),
+              ),
+              if (_selectedRecipientId != null) _buildMessageInput()
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAppBar() {
+    return Container(
+      padding: EdgeInsets.only(
+        top: MediaQuery.of(context).padding.top + 8,
+        left: 16,
+        right: 16,
+        bottom: 8,
+      ),
+      decoration: BoxDecoration(
+        gradient: AppTheme.primaryGradient,
+        boxShadow: AppTheme.softShadow,
+      ),
+      child: Row(
+        children: [
+          // Back button or menu
+          IconButton(
+            icon: const Icon(Icons.arrow_back, color: Colors.white),
+            onPressed: () => Navigator.of(context).pop(),
+          ),
+
+          const SizedBox(width: 8),
+
+          // Chat title or search
+          Expanded(
+            child: _isSearching
+                ? TextField(
+                    controller: _searchController,
+                    onChanged: _debouncedSearchUsers, // Use debounced search
+                    decoration: const InputDecoration(
+                      hintText: 'Search users...',
+                      hintStyle: TextStyle(color: Colors.white70),
+                      border: InputBorder.none,
+                    ),
+                    style: const TextStyle(color: Colors.white),
+                    autofocus: true,
+                  )
+                : Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _selectedRecipientName ?? 'Select a contact',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 18,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      Consumer<VpnService>(
+                        builder: (context, vpnService, child) {
+                          return Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: vpnService.isConnected
+                                  ? Colors.green
+                                  : Colors.orange,
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  vpnService.isConnected
+                                      ? Icons.lock
+                                      : Icons.lock_open,
+                                  size: 12,
+                                  color: Colors.white,
+                                ),
+                                const SizedBox(width: 4),
+                                Text(
+                                  vpnService.isConnected
+                                      ? 'Secure'
+                                      : 'Not secure',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+          ),
+
+          // Action buttons
+          if (!_isSearching) ...[
+            IconButton(
+              icon: const Icon(Icons.search, color: Colors.white),
+              onPressed: () {
+                setState(() => _isSearching = true);
+              },
+            ),
+            IconButton(
+              icon: const Icon(Icons.more_vert, color: Colors.white),
+              onPressed: _showOptionsMenu,
+            ),
+          ] else ...[
+            IconButton(
+              icon: const Icon(Icons.close, color: Colors.white),
+              onPressed: () {
+                setState(() {
+                  _isSearching = false;
+                  _searchController.clear();
+                  _searchResults = [];
+                });
+              },
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSearchSection() {
+    return Container(
+      color: Colors.white,
+      child: Column(
+        children: [
+          if (_searchResults.isNotEmpty)
+            SizedBox(
+              height: 200,
+              child: ListView.builder(
+                itemCount: _searchResults.length,
+                itemBuilder: (context, index) {
+                  final user = _searchResults[index];
+                  return AnimatedWidgets.animatedListItem(
+                    index: index,
+                    onTap: () => _selectUser(user),
+                    child: ListTile(
+                      leading: CircleAvatar(
+                        backgroundColor: AppTheme.primaryColor,
+                        child: Text(
+                          // ✅ Add null safety for user name
+                          (user['name'] as String?)?.isNotEmpty == true
+                              ? user['name'][0].toUpperCase()
+                              : 'U',
+                          style: const TextStyle(color: Colors.white),
+                        ),
+                      ),
+                      title: Text(user['name'] ?? 'Unknown User'),
+                      subtitle: Text(user['mobile'] ?? 'Unknown'),
+                      trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+                    ),
+                  );
+                },
+              ),
+            ),
+          const Divider(height: 1),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWelcomeView() {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Container(
+            width: 100,
+            height: 100,
+            decoration: const BoxDecoration(
+              gradient: AppTheme.primaryGradient,
+              shape: BoxShape.circle,
+            ),
+            child: const Icon(
+              Icons.chat,
+              size: 50,
+              color: Colors.white,
+            ),
+          ),
+          const SizedBox(height: 24),
+          const Text(
+            'Secure Messaging',
+            style: TextStyle(
+              fontSize: 24,
+              fontWeight: FontWeight.bold,
+              color: AppTheme.primaryColor,
+            ),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Select a contact to start chatting',
+            style: TextStyle(
+              fontSize: 16,
+              color: AppTheme.greyColor,
+            ),
+          ),
+          const SizedBox(height: 32),
+          ElevatedButton(
+            onPressed: () {
+              setState(() => _isSearching = true);
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppTheme.primaryColor,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+              shape: const RoundedRectangleBorder(
+                borderRadius: AppTheme.mediumRadius,
+              ),
+            ),
+            child: const Text('Find Contacts'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildChatView() {
+    return Container(
+      color: Colors.white,
+      child: Column(
+        children: [
+          // Show selected message count when in multi-select mode
+          if (_isMultiSelectMode)
+            Container(
+              padding: const EdgeInsets.all(8),
+              color: AppTheme.primaryColor.withValues(alpha: 0.1),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    '${_selectedMessages.length} selected',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: AppTheme.primaryColor,
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: _exitMultiSelectMode,
+                    child: const Text('Cancel'),
+                  ),
+                ],
+              ),
+            ),
+          Expanded(
+            child: Column(
+              children: [
+                // Typing indicator
+                if (_selectedRecipientId != null &&
+                    _chatService != null &&
+                    _chatService!.isUserTyping(_selectedRecipientId!))
+                  _buildTypingIndicator(),
+
+                // Loading indicator for pagination
+                if (_isLoadingMore)
+                  const Padding(
+                    padding: EdgeInsets.all(8.0),
+                    child: CircularProgressIndicator(),
+                  ),
+
+                Expanded(
+                  child: RefreshIndicator(
+                    onRefresh: _loadMessages,
+                    child: ListView.builder(
+                      controller: _scrollController,
+                      padding: const EdgeInsets.all(16),
+                      itemCount: _messages.length + (_isLoadingMore ? 1 : 0),
+                      reverse: true, // New messages appear at the bottom
+                      shrinkWrap: false, // Ensure proper scrolling
+                      itemBuilder: (context, index) {
+                        // Handle loading indicator
+                        if (_isLoadingMore && index == _messages.length) {
+                          return const Center(
+                            child: Padding(
+                              padding: EdgeInsets.all(8.0),
+                              child: CircularProgressIndicator(),
+                            ),
+                          );
+                        }
+
+                        final messageIndex = index;
+                        if (messageIndex >= _messages.length)
+                          return const SizedBox();
+
+                        final message = _messages[messageIndex];
+
+                        // Fix timestamp handling with proper null safety
+                        DateTime timestamp;
+                        try {
+                          final timestampStr = message['timestamp']?.toString();
+                          if (timestampStr != null && timestampStr.isNotEmpty) {
+                            timestamp = DateTime.parse(timestampStr);
+                          } else {
+                            timestamp = DateTime.now();
+                          }
+                        } catch (e) {
+                          // If parsing fails, use current time
+                          timestamp = DateTime.now();
+                          debugPrint(
+                              'Error parsing timestamp: $e, using current time');
+                        }
+
+                        // Determine if message is from current user using actual user ID
+                        final currentUserId =
+                            _authService?.currentUser?['id']?.toString();
+                        final messageSenderId = message['senderId']?.toString();
+                        final isMe = messageSenderId != null &&
+                            currentUserId != null &&
+                            messageSenderId == currentUserId;
+
+                        // Get message ID (use tempId if available, otherwise use id)
+                        final messageId = message['tempId']?.toString() ??
+                            message['id']?.toString() ??
+                            'msg_$messageIndex';
+
+                        // Mark message as read if it's not from current user and not already marked
+                        if (!isMe &&
+                            message['deliveryStatus'] != 'read' &&
+                            !_readMessages.contains(messageId) &&
+                            _chatService != null) {
+                          // Add to read messages set to avoid duplicate notifications
+                          _readMessages.add(messageId);
+
+                          // Notify server that message has been read
+                          try {
+                            // In a real implementation, you would emit a read event
+                            // For now, we'll just update the local status
+                            // _chatService!.markMessageRead(messageId);
+                          } catch (e) {
+                            debugPrint('Error marking message as read: $e');
+                          }
+                        }
+
+                        // Wrap the ChatBubble with Dismissible for swipe-to-delete
+                        return Dismissible(
+                          key: ValueKey(messageId),
+                          direction: isMe
+                              ? DismissDirection
+                                  .endToStart // Swipe left to delete for sent messages
+                              : DismissDirection
+                                  .startToEnd, // Swipe right to delete for received messages
+                          onDismissed: (direction) {
+                            _deleteMessage(messageId, message);
+                          },
+                          background: _buildSwipeBackground(isMe, true),
+                          secondaryBackground:
+                              _buildSwipeBackground(isMe, false),
+                          child: ChatBubble(
+                            key: ValueKey(
+                                '${messageId}_bubble'), // Add key for better animations
+                            message: message['message']?.toString() ?? '',
+                            isMe: isMe,
+                            timestamp: timestamp,
+                            deliveryStatus:
+                                message['deliveryStatus']?.toString() ?? 'sent',
+                            tempId: message['tempId']
+                                ?.toString(), // Add tempId for retry
+                            onRetry: message['deliveryStatus'] == 'failed' &&
+                                    message['tempId'] != null
+                                ? () => _retrySendMessage(
+                                    message['tempId'].toString())
+                                : null, // Add retry callback for failed messages
+                            // Add tap and long press handlers for multi-select
+                            onTap: _isMultiSelectMode
+                                ? () => _toggleMessageSelection(messageId)
+                                : null,
+                            onLongPress: _isMultiSelectMode
+                                ? null
+                                : () =>
+                                    _showMessageContextMenu(messageId, message),
+                            isSelected: _isMultiSelectMode &&
+                                _selectedMessages.contains(messageId),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSwipeBackground(bool isMe, bool isPrimary) {
+    return Container(
+      padding: EdgeInsets.symmetric(horizontal: 20),
+      color: AppTheme.errorColor,
+      child: Row(
+        mainAxisAlignment: isPrimary
+            ? (isMe ? MainAxisAlignment.end : MainAxisAlignment.start)
+            : (isMe ? MainAxisAlignment.start : MainAxisAlignment.end),
+        children: [
+          Icon(
+            Icons.delete,
+            color: Colors.white,
+          ),
+          SizedBox(width: 4),
+          Text(
+            'Delete',
+            style: TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _deleteMessage(String messageId, Map<String, dynamic> message) async {
+    try {
+      // Provide haptic feedback
+      HapticFeedback.mediumImpact();
+
+      // Delete from backend
+      await _chatService!.deleteMessage(messageId);
+
+      // Remove from local list
+      setState(() {
+        _messages.removeWhere((m) =>
+            (m['tempId']?.toString() == messageId) ||
+            (m['id']?.toString() == messageId));
+      });
+
+      // Show undo snackbar
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Message deleted'),
+          backgroundColor: AppTheme.successColor,
+          action: SnackBarAction(
+            label: 'Undo',
+            textColor: Colors.white,
+            onPressed: () {
+              // In a real implementation, you would restore the message
+              // For now, we'll just show a message
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('Undo functionality would restore the message'),
+                  backgroundColor: AppTheme.primaryColor,
+                ),
+              );
+            },
+          ),
+        ),
+      );
+    } catch (e) {
+      // Restore the message in the UI if deletion failed
+      setState(() {
+        _messages.add(message);
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to delete message: ${e.toString()}'),
+          backgroundColor: AppTheme.errorColor,
+        ),
+      );
+    }
+  }
+
+  void _showMessageContextMenu(
+      String messageId, Map<String, dynamic> message) async {
+    // Provide haptic feedback
+    HapticFeedback.lightImpact();
+
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: const Radius.circular(20)),
+      ),
+      builder: (context) {
+        return Container(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Message Options',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 16),
+              ListTile(
+                leading: const Icon(Icons.content_copy,
+                    color: AppTheme.primaryColor),
+                title: const Text('Copy'),
+                onTap: () => Navigator.pop(context, 'copy'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.reply, color: AppTheme.primaryColor),
+                title: const Text('Reply'),
+                onTap: () => Navigator.pop(context, 'reply'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.delete, color: AppTheme.errorColor),
+                title: const Text('Delete'),
+                onTap: () => Navigator.pop(context, 'delete'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.close, color: AppTheme.greyColor),
+                title: const Text('Cancel'),
+                onTap: () => Navigator.pop(context, 'cancel'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+
+    if (action == null) return;
+
+    switch (action) {
+      case 'copy':
+        Clipboard.setData(ClipboardData(text: message['message'].toString()));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('Message copied to clipboard'),
+            backgroundColor: AppTheme.primaryColor,
+          ),
+        );
+        break;
+      case 'reply':
+        // In a real implementation, you would implement reply functionality
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content:
+                const Text('Reply functionality would be implemented here'),
+            backgroundColor: AppTheme.primaryColor,
+          ),
+        );
+        break;
+      case 'delete':
+        _confirmAndDeleteMessage(messageId, message);
+        break;
+    }
+  }
+
+  void _confirmAndDeleteMessage(
+      String messageId, Map<String, dynamic> message) {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text('Delete Message'),
+          content: Text('Are you sure you want to delete this message?'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+                _deleteMessage(messageId, message);
+              },
+              child: Text('Delete'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildTypingIndicator() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Row(
+        children: [
+          const CircleAvatar(
+            radius: 12,
+            backgroundColor: AppTheme.greyColor,
+            child: Icon(
+              Icons.person,
+              size: 16,
+              color: Colors.white,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            decoration: BoxDecoration(
+              color: Colors.grey[200],
+              borderRadius: const BorderRadius.only(
+                topLeft: Radius.circular(20),
+                topRight: Radius.circular(20),
+                bottomRight: Radius.circular(20),
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                for (int i = 0; i < 3; i++)
+                  TweenAnimationBuilder<double>(
+                    duration: const Duration(milliseconds: 500),
+                    tween: Tween(begin: 0.0, end: 1.0),
+                    curve: Curves.easeInOut,
+                    builder: (context, value, child) {
+                      return Container(
+                        margin: EdgeInsets.only(
+                          right: i < 2 ? 4 : 0,
+                          top: (1 - value) * 8,
+                        ),
+                        width: 8,
+                        height: 8,
+                        decoration: BoxDecoration(
+                          color: Colors.grey[400],
+                          shape: BoxShape.circle,
+                        ),
+                      );
+                    },
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMessageInput() {
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeInOut,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.1),
+            blurRadius: 10,
+            offset: const Offset(0, -5),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          // File attachment button with animation
+          AnimatedScale(
+            scale: _showFilePicker ? 1.2 : 1.0,
+            duration: const Duration(milliseconds: 200),
+            child: IconButton(
+              icon: const Icon(Icons.attach_file, color: AppTheme.greyColor),
+              onPressed: _showFilePickerOptions,
+            ),
+          ),
+
+          const SizedBox(width: 8),
+
+          // Message input with better styling
+          Expanded(
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              decoration: BoxDecoration(
+                color: AppTheme.greyColor.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(24),
+                border: Border.all(
+                  color: AppTheme.greyColor.withValues(alpha: 0.3),
+                  width: 1,
+                ),
+              ),
+              child: TextField(
+                controller: _messageController,
+                maxLines: null,
+                keyboardType: TextInputType.multiline,
+                textInputAction: TextInputAction.newline,
+                decoration: const InputDecoration(
+                  hintText: 'Type a message...',
+                  border: InputBorder.none,
+                  contentPadding: EdgeInsets.zero,
+                ),
+                onChanged: (value) {
+                  // Send typing indicator when user starts typing with debouncing
+                  if (_selectedRecipientId != null && _chatService != null) {
+                    // Cancel previous timer
+                    _typingDebounceTimer?.cancel();
+
+                    // Set new timer with 500ms delay
+                    _typingDebounceTimer =
+                        Timer(const Duration(milliseconds: 500), () {
+                      if (value.isNotEmpty) {
+                        _chatService!
+                            .sendTypingIndicator(_selectedRecipientId!);
+                      } else {
+                        _chatService!
+                            .sendStoppedTypingIndicator(_selectedRecipientId!);
+                      }
+                    });
+                  }
+                },
+                onSubmitted: (value) {
+                  if (value.trim().isNotEmpty) {
+                    _sendMessage();
+                    // Send stopped typing indicator when message is sent
+                    if (_selectedRecipientId != null && _chatService != null) {
+                      _chatService!
+                          .sendStoppedTypingIndicator(_selectedRecipientId!);
+                    }
+                  }
+                },
+              ),
+            ),
+          ),
+
+          const SizedBox(width: 8),
+
+          // Send button with improved design and animation
+          AnimatedScale(
+            scale: _messageController.text.trim().isNotEmpty ? 1.1 : 1.0,
+            duration: const Duration(milliseconds: 200),
+            child: Container(
+              decoration: const BoxDecoration(
+                gradient: AppTheme.primaryGradient,
+                shape: BoxShape.circle,
+              ),
+              child: IconButton(
+                icon: const Icon(Icons.send, color: Colors.white),
+                onPressed: () {
+                  if (_messageController.text.trim().isNotEmpty) {
+                    _sendMessage();
+                    // Send stopped typing indicator when message is sent
+                    if (_selectedRecipientId != null && _chatService != null) {
+                      _chatService!
+                          .sendStoppedTypingIndicator(_selectedRecipientId!);
+                    }
+                  }
+                },
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showFilePickerOptions() {
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) {
+        return Container(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Select File Type',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 16),
+              ListTile(
+                leading: const Icon(Icons.image, color: AppTheme.primaryColor),
+                title: const Text('Image'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _pickImage();
+                },
+              ),
+              ListTile(
+                leading:
+                    const Icon(Icons.description, color: AppTheme.primaryColor),
+                title: const Text('Document'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _pickDocument();
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.close, color: AppTheme.greyColor),
+                title: const Text('Cancel'),
+                onTap: () => Navigator.pop(context),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  void _pickImage() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.image,
+        withData: true,
+      );
+
+      if (result != null && result.files.isNotEmpty) {
+        final file = result.files.first;
+        // In a real implementation, you would upload the file and send a message
+        // For now, we'll just send a placeholder message
+        if (_selectedRecipientId != null) {
+          await _chatService!.sendMessage(
+            recipientId: _selectedRecipientId!,
+            message: '[Image: ${file.name}]',
+            messageType: 'image',
+          );
+          _scrollToBottom();
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to pick image: ${e.toString()}'),
+            backgroundColor: AppTheme.errorColor,
+          ),
+        );
+      }
+    }
+  }
+
+  void _openFile(String fileName, String fileType) {
+    // Show file in a secure view with screenshot protection
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => FileViewerScreen(
+          fileName: fileName,
+          fileType: fileType,
+        ),
+      ),
+    );
+  }
+
+  void _pickDocument() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['pdf', 'doc', 'docx', 'txt'],
+        withData: true,
+      );
+
+      if (result != null && result.files.isNotEmpty) {
+        final file = result.files.first;
+        // In a real implementation, you would upload the file and send a message
+        // For now, we'll just send a placeholder message
+        if (_selectedRecipientId != null) {
+          await _chatService!.sendMessage(
+            recipientId: _selectedRecipientId!,
+            message: '[Document: ${file.name}]',
+            messageType: 'document',
+          );
+          _scrollToBottom();
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to pick document: ${e.toString()}'),
+            backgroundColor: AppTheme.errorColor,
+          ),
+        );
+      }
+    }
+  }
+
+  void _showOptionsMenu() {
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) {
+        return Container(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (_isMultiSelectMode) ...[
+                // Multi-select mode options
+                ListTile(
+                  leading: const Icon(Icons.delete),
+                  title: const Text('Delete Selected'),
+                  onTap: _deleteSelectedMessages,
+                ),
+                ListTile(
+                  leading: const Icon(Icons.forward),
+                  title: const Text('Forward Selected'),
+                  onTap: _forwardSelectedMessages,
+                ),
+                ListTile(
+                  leading: const Icon(Icons.close),
+                  title: const Text('Cancel Selection'),
+                  onTap: _exitMultiSelectMode,
+                ),
+              ] else ...[
+                // Regular options
+                ListTile(
+                  leading: const Icon(Icons.group),
+                  title: const Text('Contact Info'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    // Navigate to contact info screen
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => const ContactInfoScreen(),
+                      ),
+                    );
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.vpn_lock),
+                  title: const Text('VPN Settings'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _showVpnSettings();
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.logout),
+                  title: const Text('Logout'),
+                  onTap: () async {
+                    Navigator.pop(context);
+                    // ✅ Use cached service
+                    if (_authService != null) {
+                      await _authService!.logout();
+                      if (mounted) {
+                        Navigator.pushReplacementNamed(context, '/login');
+                      }
+                    }
+                  },
+                ),
+              ],
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  void _showVpnSettings() {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('VPN Settings'),
+          content: Consumer<VpnService>(
+            builder: (context, vpnService, child) {
+              return Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text('VPN Status:'),
+                      AnimatedWidgets.connectionStatus(
+                        isConnected: vpnService.isConnected,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  if (vpnService.isConnecting)
+                    const CircularProgressIndicator()
+                  else
+                    ElevatedButton(
+                      onPressed: vpnService.toggleVpn,
+                      child: Text(
+                        vpnService.isConnected ? 'Disconnect' : 'Connect',
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Close'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // Multi-select functionality methods
+  void _enterMultiSelectMode(String messageId) {
+    setState(() {
+      _isMultiSelectMode = true;
+      _selectedMessages.add(messageId);
+    });
+  }
+
+  void _toggleMessageSelection(String messageId) {
+    setState(() {
+      if (_selectedMessages.contains(messageId)) {
+        _selectedMessages.remove(messageId);
+      } else {
+        _selectedMessages.add(messageId);
+      }
+
+      // Exit multi-select mode if no messages are selected
+      if (_selectedMessages.isEmpty) {
+        _isMultiSelectMode = false;
+      }
+    });
+  }
+
+  void _exitMultiSelectMode() {
+    setState(() {
+      _isMultiSelectMode = false;
+      _selectedMessages.clear();
+    });
+  }
+
+  void _deleteSelectedMessages() {
+    // Show confirmation dialog
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Delete Messages'),
+          content: Text(
+              'Are you sure you want to delete ${_selectedMessages.length} message(s)?'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context); // Close confirmation dialog
+                Navigator.pop(context); // Close options menu
+                _performDeleteSelectedMessages();
+              },
+              child: const Text('Delete'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _performDeleteSelectedMessages() async {
+    try {
+      // Actually delete messages from the backend
+      for (final messageId in _selectedMessages) {
+        await _chatService!.deleteMessage(messageId);
+      }
+
+      // Remove deleted messages from local list
+      setState(() {
+        _messages.removeWhere((message) {
+          final msgId =
+              message['tempId']?.toString() ?? message['id']?.toString() ?? '';
+          return _selectedMessages.contains(msgId);
+        });
+        _selectedMessages.clear();
+        _isMultiSelectMode = false;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Messages deleted successfully'),
+          backgroundColor: AppTheme.successColor,
+        ),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to delete messages: ${e.toString()}'),
+          backgroundColor: AppTheme.errorColor,
+        ),
+      );
+    }
+  }
+
+  void _forwardSelectedMessages() {
+    // Close the options menu first
+    Navigator.pop(context);
+
+    // Show user selection dialog for forwarding
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Forward to'),
+          content: FutureBuilder<List<Map<String, dynamic>>>(
+            future: _chatService!.getConversations(),
+            builder: (context, snapshot) {
+              if (snapshot.connectionState == ConnectionState.waiting) {
+                return const CircularProgressIndicator();
+              } else if (snapshot.hasError) {
+                return Text('Error: ${snapshot.error}');
+              } else if (snapshot.hasData) {
+                final conversations = snapshot.data!;
+                return SizedBox(
+                  width: double.maxFinite,
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: conversations.length,
+                    itemBuilder: (context, index) {
+                      final conversation = conversations[index];
+                      return ListTile(
+                        leading: CircleAvatar(
+                          backgroundColor: AppTheme.primaryColor,
+                          child: Text(
+                            conversation['name']?.toString()[0] ?? 'U',
+                            style: const TextStyle(color: Colors.white),
+                          ),
+                        ),
+                        title: Text(conversation['name'] ?? 'Unknown User'),
+                        subtitle: Text(conversation['mobile'] ?? 'Unknown'),
+                        onTap: () {
+                          Navigator.pop(context); // Close forwarding dialog
+                          _performForwardSelectedMessages(
+                              conversation['id'].toString());
+                        },
+                      );
+                    },
+                  ),
+                );
+              } else {
+                return const Text('No contacts found');
+              }
+            },
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _performForwardSelectedMessages(String recipientId) async {
+    try {
+      // Actually send the forwarded messages
+      int forwardedCount = 0;
+      for (final message in _messages) {
+        final messageId =
+            message['tempId']?.toString() ?? message['id']?.toString() ?? '';
+        if (_selectedMessages.contains(messageId)) {
+          await _chatService!.sendMessage(
+            recipientId: recipientId,
+            message: 'Forwarded: ${message['message']}',
+          );
+          forwardedCount++;
+        }
+      }
+
+      // Clear selection and exit multi-select mode
+      setState(() {
+        _selectedMessages.clear();
+        _isMultiSelectMode = false;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('$forwardedCount message(s) forwarded successfully'),
+          backgroundColor: AppTheme.primaryColor,
+        ),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to forward messages: ${e.toString()}'),
+          backgroundColor: AppTheme.errorColor,
+        ),
+      );
+    }
+  }
+
+  Future<void> _reloadMessagesWithoutScroll() async {
+    if (_selectedRecipientId == null) return;
+
+    try {
+      // ✅ Use cached service with proper null safety
+      if (_chatService != null) {
+        final messages = await _chatService!.getMessages(_selectedRecipientId!);
+
+        if (mounted) {
+          setState(() {
+            _messages = messages;
+          });
+          // Do not scroll to bottom when reloading messages due to updates
+        }
+      }
+    } catch (e) {
+      // ✅ Fix: Use addPostFrameCallback to ensure context is ready
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _showErrorSnackBar('Failed to reload messages: ${e.toString()}');
+        }
+      });
+    }
+  }
+
+  void _retrySendMessage(String tempId) async {
+    try {
+      await _chatService!.retrySendMessage(tempId);
+      _showErrorSnackBar('Message retry initiated');
+    } catch (e) {
+      _showErrorSnackBar('Failed to retry message: ${e.toString()}');
+    }
+  }
+
+  Widget _buildShimmerLoadingMessages() {
+    return ListView.builder(
+      padding: const EdgeInsets.all(16),
+      itemCount: 10,
+      itemBuilder: (context, index) {
+        // Alternate between sent and received messages
+        final isMe = index % 2 == 0;
+
+        return AnimatedWidgets.shimmerLoading(
+          isLoading: true,
+          child: Container(
+            margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+            child: Row(
+              mainAxisAlignment:
+                  isMe ? MainAxisAlignment.end : MainAxisAlignment.start,
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                if (!isMe) ...[
+                  const CircleAvatar(
+                    radius: 12,
+                    backgroundColor: AppTheme.greyColor,
+                  ),
+                  const SizedBox(width: 8),
+                ],
+                Container(
+                  constraints: const BoxConstraints(
+                    maxWidth: 250,
+                  ),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 12,
+                  ),
+                  decoration: BoxDecoration(
+                    color: isMe ? AppTheme.primaryColor : Colors.grey[200],
+                    borderRadius: BorderRadius.only(
+                      topLeft: const Radius.circular(20),
+                      topRight: const Radius.circular(20),
+                      bottomLeft:
+                          isMe ? const Radius.circular(20) : Radius.zero,
+                      bottomRight:
+                          isMe ? Radius.zero : const Radius.circular(20),
+                    ),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: isMe
+                        ? CrossAxisAlignment.end
+                        : CrossAxisAlignment.start,
+                    children: [
+                      Container(
+                        height: 12,
+                        width: 100 + (index % 3) * 50,
+                        color: Colors.grey[300],
+                      ),
+                      const SizedBox(height: 8),
+                      Container(
+                        height: 12,
+                        width: 50 + (index % 2) * 30,
+                        color: Colors.grey[300],
+                      ),
+                    ],
+                  ),
+                ),
+                if (isMe) ...[
+                  const SizedBox(width: 8),
+                  const CircleAvatar(
+                    radius: 12,
+                    backgroundColor: AppTheme.primaryColor,
+                  ),
+                ],
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}

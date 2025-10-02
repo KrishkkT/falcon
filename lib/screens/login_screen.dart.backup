@@ -1,0 +1,725 @@
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import '../theme/app_theme.dart';
+import '../widgets/animated_widgets.dart';
+import '../services/auth_service.dart';
+import '../services/vpn_service.dart';
+import '../services/biometric_service.dart';
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen>
+    with TickerProviderStateMixin {
+  final _formKey = GlobalKey<FormState>();
+  final TextEditingController _mobileController = TextEditingController();
+  final TextEditingController _passwordController = TextEditingController();
+  final TextEditingController _totpController = TextEditingController();
+
+  static const _secureStorage = FlutterSecureStorage(
+    aOptions: AndroidOptions(
+      encryptedSharedPreferences: true,
+    ),
+    iOptions: IOSOptions(
+      accountName: 'falcon_chat',
+    ),
+  );
+
+  // Animation controllers
+  late AnimationController _animationController;
+  late AnimationController _logoAnimationController;
+  late Animation<double> _fadeAnimation;
+  late Animation<Offset> _slideAnimation;
+  late Animation<double> _logoScaleAnimation;
+
+  bool _isLoading = false;
+  bool _isBiometricAvailable = false;
+  bool _obscurePassword = true;
+  bool _shouldShowBiometricPrompt = false;
+  bool _isVpnConnecting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _setupAnimations();
+    _checkBiometricAvailabilityAndPrompt();
+  }
+
+  void _setupAnimations() {
+    _animationController = AnimationController(
+      duration: const Duration(milliseconds: 1500),
+      vsync: this,
+    );
+
+    _logoAnimationController = AnimationController(
+      duration: const Duration(milliseconds: 2000),
+      vsync: this,
+    );
+
+    _fadeAnimation = Tween<double>(
+      begin: 0.0,
+      end: 1.0,
+    ).animate(CurvedAnimation(
+      parent: _animationController,
+      curve: const Interval(0.0, 0.8, curve: Curves.easeOut),
+    ));
+
+    _slideAnimation = Tween<Offset>(
+      begin: const Offset(0, 0.5),
+      end: Offset.zero,
+    ).animate(CurvedAnimation(
+      parent: _animationController,
+      curve: const Interval(0.2, 1.0, curve: Curves.elasticOut),
+    ));
+
+    _logoScaleAnimation = Tween<double>(
+      begin: 0.0,
+      end: 1.0,
+    ).animate(CurvedAnimation(
+      parent: _logoAnimationController,
+      curve: Curves.elasticOut,
+    ));
+
+    _logoAnimationController.forward();
+    _animationController.forward();
+  }
+
+  Future<void> _checkBiometricAvailabilityAndPrompt() async {
+    final isAvailable = await BiometricService.isBiometricAvailable();
+
+    setState(() {
+      _isBiometricAvailable = isAvailable;
+      // Show biometric prompt if available
+      _shouldShowBiometricPrompt = isAvailable;
+    });
+
+    // If biometric is available, show a prompt to the user
+    if (isAvailable && mounted) {
+      // Check if this is the first time (no stored preference)
+      const storage = FlutterSecureStorage();
+      final hasSeenPrompt = await storage.read(key: 'biometric_prompt_shown');
+
+      if (hasSeenPrompt != 'true') {
+        // Show prompt to enable biometric authentication
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showBiometricPrompt();
+        });
+      }
+    }
+  }
+
+  void _showBiometricPrompt() {
+    if (!mounted) return;
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Enable Biometric Authentication'),
+          content: const Text(
+            'Would you like to enable biometric authentication (fingerprint or face recognition) for faster and more secure login?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+                // Save preference so we don't show again
+                const storage = FlutterSecureStorage();
+                storage.write(key: 'biometric_prompt_shown', value: 'true');
+              },
+              child: const Text('Not Now'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                Navigator.pop(context);
+                // Save preference and enable biometric
+                const storage = FlutterSecureStorage();
+                storage.write(key: 'biometric_prompt_shown', value: 'true');
+                _enableBiometricAuthentication();
+              },
+              child: const Text('Enable'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _enableBiometricAuthentication() async {
+    if (!_isBiometricAvailable) return;
+
+    setState(() => _isLoading = true);
+
+    try {
+      // Authenticate with biometrics to confirm
+      final isAuthenticated =
+          await BiometricService.authenticateWithBiometrics();
+
+      if (isAuthenticated) {
+        // Save biometric preference
+        const storage = FlutterSecureStorage();
+        await storage.write(key: 'biometric_enabled', value: 'true');
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Biometric authentication enabled successfully'),
+              backgroundColor: AppTheme.successColor,
+            ),
+          );
+        }
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Biometric authentication setup cancelled'),
+              backgroundColor: AppTheme.greyColor,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('Biometric setup error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Biometric setup failed: ${e.toString()}'),
+            backgroundColor: AppTheme.errorColor,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
+    }
+  }
+
+  Future<void> _login() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    setState(() => _isLoading = true);
+
+    try {
+      final authService = Provider.of<AuthService>(context, listen: false);
+      final result = await authService.login(
+        mobile: _mobileController.text.trim(),
+        password: _passwordController.text,
+        totpCode: _totpController.text,
+      );
+
+      if (result['success']) {
+        debugPrint('Login successful');
+
+        // Start VPN connection after successful login
+        await _startVpnConnection();
+
+        if (mounted) {
+          // Instead of immediately checking authentication after VPN,
+          // give some time for network to stabilize and then check
+          await Future.delayed(const Duration(seconds: 2));
+
+          // Check if user is still authenticated after VPN connection
+          bool stillAuthenticated = false;
+          try {
+            stillAuthenticated = await authService.isLoggedIn();
+          } catch (e) {
+            debugPrint('Error checking authentication after VPN: $e');
+            // If there's an error checking authentication, assume it's still valid
+            // since we just successfully logged in
+            stillAuthenticated = true;
+          }
+
+          if (stillAuthenticated) {
+            debugPrint('User still authenticated after VPN connection');
+            Navigator.pushReplacementNamed(context, '/dashboard');
+          } else {
+            debugPrint('User needs to re-authenticate after VPN connection');
+            // Show a message that VPN is connected and redirect to dashboard
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Row(
+                  children: [
+                    Icon(Icons.info, color: Colors.white),
+                    SizedBox(width: 8),
+                    Text('VPN connected - Redirecting to secure dashboard'),
+                  ],
+                ),
+                backgroundColor: AppTheme.primaryColor,
+                duration: Duration(seconds: 2),
+              ),
+            );
+            await Future.delayed(const Duration(seconds: 2));
+            if (mounted) {
+              Navigator.pushReplacementNamed(context, '/dashboard');
+            }
+          }
+        }
+      } else {
+        _showErrorDialog(result['message']);
+      }
+    } catch (e) {
+      debugPrint('Login error: $e');
+      _showErrorDialog('Login failed: ${e.toString()}');
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
+    }
+  }
+
+  Future<void> _biometricLogin() async {
+    if (!_isBiometricAvailable) return;
+
+    setState(() => _isLoading = true);
+
+    try {
+      // Authenticate with biometrics
+      final isAuthenticated =
+          await BiometricService.authenticateWithBiometrics();
+
+      if (isAuthenticated) {
+        // If biometric authentication is successful, proceed to dashboard
+        if (mounted) {
+          Navigator.pushReplacementNamed(context, '/dashboard');
+        }
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Biometric authentication failed'),
+              backgroundColor: AppTheme.errorColor,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('Biometric login error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Biometric login failed: ${e.toString()}'),
+            backgroundColor: AppTheme.errorColor,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
+    }
+  }
+
+  Future<void> _startVpnConnection() async {
+    setState(() => _isVpnConnecting = true);
+
+    try {
+      final vpnService = Provider.of<VpnService>(context, listen: false);
+      await vpnService.startVpn();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Row(
+              children: [
+                Icon(Icons.shield, color: Colors.white),
+                SizedBox(width: 8),
+                Text('VPN connected - Your connection is secure'),
+              ],
+            ),
+            backgroundColor: AppTheme.successColor,
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('VPN connection failed: ${e.toString()}'),
+            backgroundColor: AppTheme.warningColor,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isVpnConnecting = false);
+      }
+    }
+  }
+
+  void _showErrorDialog(String message) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape:
+            const RoundedRectangleBorder(borderRadius: AppTheme.mediumRadius),
+        title: const Row(
+          children: [
+            Icon(Icons.error, color: AppTheme.errorColor),
+            SizedBox(width: 12),
+            Text('Login Failed'),
+          ],
+        ),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(gradient: AppTheme.primaryGradient),
+        child: SafeArea(
+          child: AnimatedBuilder(
+            animation: _animationController,
+            builder: (context, child) {
+              return FadeTransition(
+                opacity: _fadeAnimation,
+                child: SlideTransition(
+                  position: _slideAnimation,
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.all(24),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const SizedBox(height: 60),
+
+                        // Animated Logo
+                        AnimatedBuilder(
+                          animation: _logoAnimationController,
+                          builder: (context, child) {
+                            return Transform.scale(
+                              scale: _logoScaleAnimation.value,
+                              child: Column(
+                                children: [
+                                  Hero(
+                                    tag: 'app_logo',
+                                    child: Container(
+                                      width: 120,
+                                      height: 120,
+                                      decoration: BoxDecoration(
+                                        color:
+                                            Colors.white.withValues(alpha: 0.2),
+                                        shape: BoxShape.circle,
+                                        boxShadow: [
+                                          BoxShadow(
+                                            color: Colors.black
+                                                .withValues(alpha: 0.2),
+                                            blurRadius: 30,
+                                            offset: const Offset(0, 15),
+                                          ),
+                                        ],
+                                      ),
+                                      child: const Icon(
+                                        Icons.security,
+                                        size: 60,
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(height: 24),
+                                  const Text(
+                                    'Falcon',
+                                    style: TextStyle(
+                                      fontSize: 36,
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.white,
+                                      letterSpacing: 2,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 8),
+                                  Text(
+                                    'Secure • Private • Protected',
+                                    style: TextStyle(
+                                      fontSize: 16,
+                                      color:
+                                          Colors.white.withValues(alpha: 0.8),
+                                      letterSpacing: 1,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            );
+                          },
+                        ),
+
+                        const SizedBox(height: 60),
+
+                        // Login Form Container
+                        Container(
+                          padding: const EdgeInsets.all(32),
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            borderRadius: AppTheme.extraLargeRadius,
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withValues(alpha: 0.1),
+                                blurRadius: 30,
+                                offset: const Offset(0, 15),
+                              ),
+                            ],
+                          ),
+                          child: Form(
+                            key: _formKey,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                // Welcome Text
+                                AnimatedWidgets.slideInContainer(
+                                  index: 0,
+                                  child: const Column(
+                                    children: [
+                                      Text(
+                                        'Welcome Back',
+                                        style: AppTheme.headingStyle,
+                                      ),
+                                      SizedBox(height: 8),
+                                      Text(
+                                        'Sign in to continue secure messaging',
+                                        style: AppTheme.captionStyle,
+                                      ),
+                                    ],
+                                  ),
+                                ),
+
+                                const SizedBox(height: 32),
+
+                                // Mobile Field
+                                AnimatedWidgets.slideInContainer(
+                                  index: 1,
+                                  child: AnimatedWidgets.animatedTextField(
+                                    label: 'Mobile Number',
+                                    controller: _mobileController,
+                                    keyboardType: TextInputType.phone,
+                                    prefixIcon:
+                                        const Icon(Icons.phone_outlined),
+                                    validator: (value) {
+                                      if (value == null ||
+                                          value.trim().isEmpty) {
+                                        return 'Mobile number is required';
+                                      }
+                                      return null;
+                                    },
+                                  ),
+                                ),
+
+                                const SizedBox(height: 16),
+
+                                // Password Field
+                                AnimatedWidgets.slideInContainer(
+                                  index: 2,
+                                  child: AnimatedWidgets.animatedTextField(
+                                    label: 'Password',
+                                    controller: _passwordController,
+                                    obscureText: _obscurePassword,
+                                    prefixIcon: const Icon(Icons.lock_outline),
+                                    suffixIcon: IconButton(
+                                      icon: Icon(
+                                        _obscurePassword
+                                            ? Icons.visibility_off
+                                            : Icons.visibility,
+                                      ),
+                                      onPressed: () {
+                                        setState(() {
+                                          _obscurePassword = !_obscurePassword;
+                                        });
+                                      },
+                                    ),
+                                    validator: (value) {
+                                      if (value == null || value.isEmpty) {
+                                        return 'Password is required';
+                                      }
+                                      return null;
+                                    },
+                                  ),
+                                ),
+
+                                const SizedBox(height: 16),
+
+                                // TOTP Field
+                                AnimatedWidgets.slideInContainer(
+                                  index: 3,
+                                  child: AnimatedWidgets.animatedTextField(
+                                    label: 'Authenticator Code',
+                                    controller: _totpController,
+                                    keyboardType: TextInputType.number,
+                                    prefixIcon: const Icon(
+                                        Icons.verified_user_outlined),
+                                    validator: (value) {
+                                      if (value == null || value.length != 6) {
+                                        return 'Enter 6-digit authenticator code';
+                                      }
+                                      return null;
+                                    },
+                                  ),
+                                ),
+
+                                const SizedBox(height: 32),
+
+                                // Biometric Login Button (if available)
+                                if (_isBiometricAvailable)
+                                  AnimatedWidgets.slideInContainer(
+                                    index: 4,
+                                    child: AnimatedWidgets.gradientButton(
+                                      text: 'Use Biometric Authentication',
+                                      onPressed: _biometricLogin,
+                                      loading: _isLoading,
+                                      icon: Icons.fingerprint,
+                                    ),
+                                  ),
+
+                                const SizedBox(height: 16),
+
+                                // Login Button
+                                AnimatedWidgets.slideInContainer(
+                                  index: 5,
+                                  child: AnimatedWidgets.gradientButton(
+                                    text: _isVpnConnecting
+                                        ? 'Connecting VPN...'
+                                        : 'Sign In',
+                                    onPressed: _login,
+                                    loading: _isLoading || _isVpnConnecting,
+                                    icon: _isVpnConnecting
+                                        ? Icons.vpn_lock
+                                        : Icons.login,
+                                  ),
+                                ),
+
+                                const SizedBox(height: 24),
+
+                                // Register Link
+                                AnimatedWidgets.slideInContainer(
+                                  index: 6,
+                                  child: Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      const Text(
+                                        "Don't have an account? ",
+                                        style: AppTheme.captionStyle,
+                                      ),
+                                      GestureDetector(
+                                        onTap: () {
+                                          Navigator.pushReplacementNamed(
+                                              context, '/register');
+                                        },
+                                        child: const Text(
+                                          'Register',
+                                          style: TextStyle(
+                                            color: AppTheme.primaryColor,
+                                            fontWeight: FontWeight.w600,
+                                            decoration:
+                                                TextDecoration.underline,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+
+                        const SizedBox(height: 40),
+
+                        // Security Features
+                        AnimatedWidgets.slideInContainer(
+                          index: 7,
+                          child: Container(
+                            padding: const EdgeInsets.all(24),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withValues(alpha: 0.1),
+                              borderRadius: AppTheme.mediumRadius,
+                              border: Border.all(
+                                color: Colors.white.withValues(alpha: 0.2),
+                              ),
+                            ),
+                            child: Column(
+                              children: [
+                                const Text(
+                                  'Your Security Features',
+                                  style: TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.w600,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                                const SizedBox(height: 16),
+                                Row(
+                                  mainAxisAlignment:
+                                      MainAxisAlignment.spaceAround,
+                                  children: [
+                                    _buildSecurityFeature(
+                                      Icons.vpn_lock,
+                                      'VPN\nProtected',
+                                    ),
+                                    _buildSecurityFeature(
+                                      Icons.enhanced_encryption,
+                                      'End-to-End\nEncrypted',
+                                    ),
+                                    _buildSecurityFeature(
+                                      Icons.verified_user,
+                                      'Two-Factor\nAuth',
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSecurityFeature(IconData icon, String label) {
+    return Column(
+      children: [
+        Container(
+          width: 50,
+          height: 50,
+          decoration: BoxDecoration(
+            color: Colors.white.withValues(alpha: 0.2),
+            shape: BoxShape.circle,
+          ),
+          child: Icon(
+            icon,
+            color: Colors.white,
+            size: 24,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: 12,
+            color: Colors.white.withValues(alpha: 0.8),
+            fontWeight: FontWeight.w500,
+          ),
+          textAlign: TextAlign.center,
+        ),
+      ],
+    );
+  }
+}

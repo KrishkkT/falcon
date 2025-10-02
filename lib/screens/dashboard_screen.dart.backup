@@ -1,0 +1,1444 @@
+// ignore_for_file: invalid_use_of_protected_member
+
+import 'package:flutter/material.dart';
+// import 'package:flutter_staggered_animations/flutter_staggered_animations.dart';
+import 'package:provider/provider.dart';
+import 'dart:io';
+import 'dart:async';
+
+import '../theme/app_theme.dart';
+import '../widgets/animated_widgets.dart';
+import '../services/auth_service.dart';
+import '../services/vpn_service.dart';
+import '../services/chat_service.dart';
+import '../services/network_config_service.dart';
+import '../services/notification_service.dart';
+import '../widgets/session_status_widget.dart';
+// Error banner removed
+import '../widgets/animated_fab.dart';
+import 'chat_screen.dart';
+
+class DashboardScreen extends StatefulWidget {
+  const DashboardScreen({super.key});
+
+  @override
+  State<DashboardScreen> createState() => _DashboardScreenState();
+}
+
+class _DashboardScreenState extends State<DashboardScreen>
+    with TickerProviderStateMixin {
+  late AnimationController _animationController;
+  late Animation<double> _fadeAnimation;
+  late ChatService _chatService; // Store reference to chat service
+
+  final TextEditingController _searchController = TextEditingController();
+  List<Map<String, dynamic>> _conversations = [];
+  List<Map<String, dynamic>> _searchResults = [];
+  bool _isLoading = true;
+  bool _isSearching = false;
+  bool _isLoadingSearch = false;
+  bool _vpnWarningShown = false; // Track if VPN warning has been shown
+
+  // Debouncing for auto-refresh
+  Timer? _refreshTimer;
+  Timer? _searchDebounceTimer;
+  DateTime _lastRefreshTime = DateTime.now();
+  static const Duration _minRefreshInterval = Duration(seconds: 30);
+
+  @override
+  void initState() {
+    super.initState();
+    _setupAnimations();
+    // Delay service initialization to ensure providers are ready
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _initializeServices();
+      _loadConversations();
+    });
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Add listener to chat service for automatic updates with debouncing
+    _chatService = Provider.of<ChatService>(context, listen: false);
+    _chatService.addListener(_handleChatServiceUpdate);
+  }
+
+  void _handleChatServiceUpdate() {
+    debugPrint('Chat service updated, checking if refresh is needed');
+
+    // Implement debouncing to prevent excessive refreshes
+    final now = DateTime.now();
+    final timeSinceLastRefresh = now.difference(_lastRefreshTime);
+
+    if (timeSinceLastRefresh > _minRefreshInterval) {
+      debugPrint('Refreshing conversations after debounce period');
+      _lastRefreshTime = now;
+      _loadConversations();
+    } else {
+      debugPrint(
+          'Skipping refresh due to debounce - ${timeSinceLastRefresh.inSeconds} seconds since last refresh');
+      // Schedule refresh after minimum interval if not already scheduled
+      if (_refreshTimer == null || !_refreshTimer!.isActive) {
+        _refreshTimer = Timer(_minRefreshInterval - timeSinceLastRefresh, () {
+          if (mounted) {
+            debugPrint('Executing delayed refresh');
+            _lastRefreshTime = DateTime.now();
+            _loadConversations();
+          }
+        });
+      }
+    }
+  }
+
+  void _initializeServices() {
+    try {
+      final authService = Provider.of<AuthService>(context, listen: false);
+      final vpnService = Provider.of<VpnService>(context, listen: false);
+      final notificationService =
+          Provider.of<NotificationService>(context, listen: false);
+
+      debugPrint(
+          'Initializing services with auth token: ${authService.authToken != null}');
+
+      // Set up notification tap handler
+      notificationService
+          .setOnSelectNotificationCallback(_handleNotificationTap);
+
+      // Try to start VPN automatically and inform chat service
+      _startVpnIfNeeded(vpnService, _chatService);
+
+      if (authService.authToken != null) {
+        // Initialize chat service immediately
+        try {
+          _chatService.initialize(authService.authToken!);
+          debugPrint('Chat service initialized with token');
+
+          // Load conversations after a short delay to ensure initialization is complete
+          Future.delayed(const Duration(milliseconds: 500), () {
+            _loadConversations();
+          });
+        } catch (e) {
+          debugPrint('Error initializing chat service: $e');
+          _showErrorSnackBar('Failed to initialize chat service');
+        }
+      } else {
+        // Check if token exists in secure storage
+        WidgetsBinding.instance.addPostFrameCallback((_) async {
+          if (mounted) {
+            try {
+              // Check if token exists in secure storage
+              final tokenValid = await authService.isLoggedIn();
+              if (tokenValid && authService.authToken != null) {
+                // Token exists, initialize services
+                _chatService.initialize(authService.authToken!);
+                debugPrint('Chat service initialized with stored token');
+
+                // Reload conversations after a short delay
+                Future.delayed(const Duration(milliseconds: 500), () {
+                  _loadConversations();
+                });
+              } else {
+                debugPrint(
+                    'No valid auth token available, redirecting to login');
+                if (mounted) {
+                  Navigator.pushReplacementNamed(context, '/login');
+                }
+              }
+            } catch (e) {
+              debugPrint('Error checking stored token: $e');
+              // If there's an error, redirect to login
+              if (mounted) {
+                Navigator.pushReplacementNamed(context, '/login');
+              }
+            }
+          }
+        });
+      }
+    } catch (e) {
+      debugPrint('Error initializing services: $e');
+      _showErrorSnackBar('Failed to initialize services');
+    }
+  }
+
+  /// Handle notification tap to open specific chat
+  void _handleNotificationTap(String conversationId) {
+    debugPrint('Notification tapped for conversation: $conversationId');
+
+    if (mounted) {
+      // Navigate to chat screen with the conversation ID
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (context) => ChatScreen(
+            recipientId:
+                conversationId.split('_').first, // Extract recipient ID
+            recipientName:
+                'Unknown User', // This would be looked up from contacts
+          ),
+        ),
+      );
+    }
+  }
+
+  Future<void> _startVpnIfNeeded(
+      VpnService vpnService, ChatService chatService) async {
+    try {
+      // Check if VPN is already connected
+      if (vpnService.isConnected) {
+        debugPrint('VPN already connected');
+        chatService.setVpnStatus(true);
+        NetworkConfigService.setVpnStatus(true); // Also update network config
+        return;
+      }
+
+      // Check if VPN permission is granted
+      final isPermissionGranted = await vpnService.isVpnPermissionGranted();
+      if (!isPermissionGranted) {
+        debugPrint('VPN permission not granted, skipping auto-connect');
+        chatService.setVpnStatus(false);
+        NetworkConfigService.setVpnStatus(false); // Also update network config
+        return;
+      }
+
+      // Try to start VPN
+      debugPrint('Attempting to start VPN automatically from dashboard');
+      await vpnService.startVpn();
+      debugPrint('VPN started successfully from dashboard');
+      chatService.setVpnStatus(true);
+      NetworkConfigService.setVpnStatus(true); // Also update network config
+
+      // Reload conversations after VPN status change
+      await Future.delayed(const Duration(milliseconds: 500));
+      if (mounted) {
+        await _loadConversations();
+      }
+    } catch (e) {
+      debugPrint('Failed to start VPN automatically from dashboard: $e');
+      chatService.setVpnStatus(false);
+      NetworkConfigService.setVpnStatus(false); // Also update network config
+      // Don't throw the error, just log it - we don't want VPN issues to prevent app usage
+    }
+  }
+
+  void _setupAnimations() {
+    _animationController = AnimationController(
+      duration: const Duration(milliseconds: 1000),
+      vsync: this,
+    );
+
+    _fadeAnimation = Tween<double>(
+      begin: 0.0,
+      end: 1.0,
+    ).animate(CurvedAnimation(
+      parent: _animationController,
+      curve: Curves.easeInOut,
+    ));
+
+    _animationController.forward();
+  }
+
+  Future<void> _loadConversations() async {
+    // Cancel any pending refresh timer
+    _refreshTimer?.cancel();
+
+    // Additional rate limiting to prevent excessive API calls
+    final now = DateTime.now();
+    final timeSinceLastCall = now.difference(_lastRefreshTime);
+
+    // Minimum 3 seconds between conversation loads
+    if (timeSinceLastCall < const Duration(seconds: 3)) {
+      debugPrint('Skipping conversation load due to rate limiting');
+      return;
+    }
+
+    try {
+      setState(() {
+        _isLoading = true;
+      });
+
+      debugPrint('Attempting to load conversations...');
+
+      // Add a small delay to ensure network is ready
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      final conversations = await _chatService.getConversations();
+
+      debugPrint('Loaded ${conversations.length} conversations');
+
+      // Log first few conversations for debugging
+      if (conversations.isNotEmpty) {
+        for (int i = 0; i < conversations.length && i < 3; i++) {
+          debugPrint('Conversation $i: ${conversations[i]}');
+        }
+      } else {
+        debugPrint('No conversations found');
+      }
+
+      if (mounted) {
+        setState(() {
+          _conversations = conversations;
+          _isLoading = false;
+          _vpnWarningShown = false; // Reset VPN warning flag on successful load
+        });
+        _lastRefreshTime = DateTime.now(); // Update last refresh time
+        debugPrint('Updated UI with ${conversations.length} conversations');
+      }
+    } on TimeoutException {
+      debugPrint('Timeout error loading conversations');
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+      // Just log the error, don't show any banners
+      debugPrint('Request timeout. Please check your network connection.');
+    } on SocketException catch (e) {
+      debugPrint('Network error loading conversations: $e');
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+      // Just log the error, don't show any banners
+      debugPrint('Network error. Please check your connection.');
+    } catch (e) {
+      debugPrint('Error loading conversations: $e');
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+      // Just log the error, don't show any banners
+      debugPrint('Failed to load conversations: ${e.toString()}');
+    }
+  }
+
+  void _showVpnWarning() {
+    // Only show the VPN warning once per session to avoid spam
+    if (_vpnWarningShown) return;
+
+    _vpnWarningShown = true;
+
+    // Show a more detailed warning about VPN issues
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        showDialog(
+          context: context,
+          builder: (BuildContext context) {
+            return AlertDialog(
+              title: const Text('VPN Connection Issue'),
+              content: const Text(
+                  'The VPN is interfering with connections to your local development server. '
+                  'For local development, please disable the VPN or connect to a different network.\n\n'
+                  'You can disable the VPN from the menu (tap the three dots in the top right).'),
+              actions: [
+                TextButton(
+                  onPressed: () {
+                    Navigator.of(context).pop();
+                  },
+                  child: const Text('OK'),
+                ),
+              ],
+            );
+          },
+        );
+      }
+    });
+  }
+
+  void _showErrorSnackBar(String message) {
+    // Remove all error banners and just log to console
+    debugPrint('Error: $message');
+  }
+
+  String _formatTime(String timestamp) {
+    try {
+      final DateTime serverTime = DateTime.parse(timestamp);
+      // Convert server time to device local time
+      final DateTime dateTime = serverTime.toLocal();
+      final Duration difference = DateTime.now().difference(dateTime);
+
+      if (difference.inMinutes < 1) {
+        return 'now';
+      } else if (difference.inHours < 1) {
+        return '${difference.inMinutes}m';
+      } else if (difference.inDays < 1) {
+        return '${difference.inHours}h';
+      } else if (difference.inDays < 7) {
+        return '${difference.inDays}d';
+      } else {
+        return '${dateTime.day}/${dateTime.month}';
+      }
+    } catch (e) {
+      return '';
+    }
+  }
+
+  void _startChat(Map<String, dynamic> user) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => ChatScreen(
+          recipientId: user['id'],
+          recipientName: user['name'],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _searchUsers(String query) async {
+    if (query.trim().isEmpty) {
+      setState(() {
+        _searchResults = [];
+        _isLoadingSearch = false;
+      });
+      return;
+    }
+
+    // Cancel previous debounce timer
+    _searchDebounceTimer?.cancel();
+
+    // Set loading state immediately for better UX
+    setState(() {
+      _isLoadingSearch = true;
+    });
+
+    // Debounce search requests
+    _searchDebounceTimer = Timer(const Duration(milliseconds: 300), () async {
+      try {
+        final chatService = Provider.of<ChatService>(context, listen: false);
+        final results = await chatService.searchUsers(query);
+
+        if (mounted) {
+          setState(() {
+            _searchResults = results;
+            _isLoadingSearch = false;
+          });
+
+          // Log the number of results found
+          debugPrint(
+              'Search completed. Found ${results.length} users for query: $query');
+        }
+      } catch (e) {
+        if (mounted) {
+          setState(() {
+            _isLoadingSearch = false;
+          });
+
+          // Provide user-friendly error messages
+          String errorMessage = 'Search failed';
+
+          if (e.toString().contains('Network')) {
+            errorMessage =
+                'Network connection failed - please check your internet';
+          } else if (e.toString().contains('timeout')) {
+            errorMessage = 'Search timeout - please try again';
+          } else if (e.toString().contains('Not authenticated')) {
+            errorMessage = 'Session expired - please login again';
+          } else if (e.toString().contains('No users found')) {
+            // This is not an error, just no results
+            setState(() {
+              _searchResults = [];
+            });
+            return;
+          } else {
+            errorMessage = 'Search failed - please try again';
+          }
+
+          debugPrint('Search error: $e');
+          _showErrorSnackBar(errorMessage);
+        }
+      }
+    });
+  }
+
+  void _showMenuOptions() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true, // Allow the sheet to take full height if needed
+      builder: (context) => Container(
+        margin: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Colors.white, // Use white background consistently
+          borderRadius: AppTheme.largeRadius,
+          boxShadow: AppTheme.strongShadow,
+        ),
+        child: SingleChildScrollView(
+          // Wrap with SingleChildScrollView to prevent overflow
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Handle
+              Container(
+                width: 40,
+                height: 4,
+                margin: const EdgeInsets.only(top: 12),
+                decoration: BoxDecoration(
+                  color: Colors.grey[300], // Use consistent grey color
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+
+              const SizedBox(height: 24),
+
+              // Menu Title
+              const Text(
+                'Security Menu',
+                style: AppTheme.headingStyle,
+              ),
+
+              const SizedBox(height: 24),
+
+              // Menu Options
+              ListTile(
+                leading: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: AppTheme.primaryColor.withValues(alpha: 0.1),
+                    borderRadius: AppTheme.smallRadius,
+                  ),
+                  child: const Icon(
+                    Icons.person,
+                    color: AppTheme.primaryColor,
+                  ),
+                ),
+                title: const Text(
+                  'Profile & Security',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w500,
+                    color: AppTheme.darkColor,
+                  ),
+                ),
+                subtitle: const Text(
+                  'Security settings, VPN status, audit logs',
+                  style: AppTheme.captionStyle,
+                ),
+                trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.pushNamed(context, '/profile');
+                },
+              ),
+
+              const Divider(),
+
+              ListTile(
+                leading: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: Colors.green.withValues(alpha: 0.1),
+                    borderRadius: AppTheme.smallRadius,
+                  ),
+                  child: const Icon(
+                    Icons.contacts,
+                    color: Colors.green,
+                  ),
+                ),
+                title: const Text(
+                  'Contacts',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w500,
+                    color: AppTheme.darkColor,
+                  ),
+                ),
+                subtitle: const Text(
+                  'View and manage your contacts',
+                  style: AppTheme.captionStyle,
+                ),
+                trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.pushNamed(context, '/contacts');
+                },
+              ),
+
+              const Divider(),
+
+              ListTile(
+                leading: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: Colors.blue.withValues(alpha: 0.1),
+                    borderRadius: AppTheme.smallRadius,
+                  ),
+                  child: const Icon(
+                    Icons.vpn_lock,
+                    color: Colors.blue,
+                  ),
+                ),
+                title: const Text(
+                  'VPN Settings',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w500,
+                    color: AppTheme.darkColor,
+                  ),
+                ),
+                subtitle: const Text(
+                  'Enable/disable VPN for secure messaging',
+                  style: AppTheme.captionStyle,
+                ),
+                trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showVpnSettings();
+                },
+              ),
+
+              const Divider(),
+
+              ListTile(
+                leading: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: Colors.red.withValues(alpha: 0.1),
+                    borderRadius: AppTheme.smallRadius,
+                  ),
+                  child: const Icon(
+                    Icons.logout,
+                    color: Colors.red,
+                  ),
+                ),
+                title: const Text(
+                  'Logout',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w500,
+                    color: AppTheme.darkColor,
+                  ),
+                ),
+                subtitle: const Text(
+                  'Sign out of your account',
+                  style: AppTheme.captionStyle,
+                ),
+                trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+                onTap: () async {
+                  Navigator.pop(context);
+                  final authService =
+                      Provider.of<AuthService>(context, listen: false);
+                  await authService.logout();
+                  if (mounted) {
+                    Navigator.pushReplacementNamed(context, '/login');
+                  }
+                },
+              ),
+
+              const SizedBox(height: 24),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showVpnSettings() {
+    final vpnService = Provider.of<VpnService>(context, listen: false);
+    final chatService = Provider.of<ChatService>(context, listen: false);
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (context) => Container(
+        margin: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Colors.white, // Use white background consistently
+          borderRadius: AppTheme.largeRadius,
+          boxShadow: AppTheme.strongShadow,
+        ),
+        child: StatefulBuilder(
+          builder: (BuildContext context, StateSetter setState) {
+            return SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Handle
+                  Container(
+                    width: 40,
+                    height: 4,
+                    margin: const EdgeInsets.only(top: 12),
+                    decoration: BoxDecoration(
+                      color: Colors.grey[300], // Use consistent grey color
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+
+                  const SizedBox(height: 24),
+
+                  // Title
+                  const Text(
+                    'VPN Settings',
+                    style: AppTheme.headingStyle,
+                  ),
+
+                  const SizedBox(height: 8),
+
+                  const Text(
+                    'Secure your communications with military-grade encryption',
+                    style: AppTheme.captionStyle,
+                    textAlign: TextAlign.center,
+                  ),
+
+                  const SizedBox(height: 24),
+
+                  // VPN Status Card
+                  Container(
+                    padding: const EdgeInsets.all(20),
+                    margin: const EdgeInsets.symmetric(horizontal: 16),
+                    decoration: BoxDecoration(
+                      color: vpnService.isConnected
+                          ? Colors.green.withValues(alpha: 0.1)
+                          : Colors.grey.withValues(alpha: 0.1),
+                      borderRadius: AppTheme.mediumRadius,
+                      border: Border.all(
+                        color: vpnService.isConnected
+                            ? Colors.green.withValues(alpha: 0.3)
+                            : Colors.grey.withValues(alpha: 0.3),
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: vpnService.isConnected
+                                ? Colors.green
+                                : Colors.grey,
+                            shape: BoxShape.circle,
+                          ),
+                          child: Icon(
+                            vpnService.isConnected
+                                ? Icons.lock
+                                : Icons.lock_open,
+                            color: Colors.white,
+                          ),
+                        ),
+                        const SizedBox(width: 16),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                vpnService.isConnected
+                                    ? 'VPN Connected'
+                                    : 'VPN Disconnected',
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 16,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              const Text(
+                                'Secure connection active',
+                                style: AppTheme.captionStyle,
+                              ),
+                            ],
+                          ),
+                        ),
+                        Switch(
+                          value: vpnService.isConnected,
+                          onChanged: (value) async {
+                            if (value) {
+                              // Enable VPN
+                              try {
+                                await vpnService.startVpn();
+                                chatService.setVpnStatus(true);
+                                if (mounted) {
+                                  setState(() {}); // Update UI
+                                }
+                                // Show simple message using debug print instead of snackbar
+                                debugPrint('VPN enabled successfully');
+                              } catch (e) {
+                                debugPrint('Failed to start VPN: $e');
+                              }
+                            } else {
+                              // Disable VPN
+                              try {
+                                await vpnService.stopVpn();
+                                chatService.setVpnStatus(false);
+                                if (mounted) {
+                                  setState(() {}); // Update UI
+                                }
+                                // Reload conversations when VPN is disabled
+                                await _loadConversations();
+                                debugPrint('VPN disabled successfully');
+                              } catch (e) {
+                                debugPrint('Failed to stop VPN: $e');
+                              }
+                            }
+                          },
+                          activeThumbColor: AppTheme.primaryColor,
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 24),
+
+                  // VPN Info
+                  Container(
+                    padding: const EdgeInsets.all(16),
+                    margin: const EdgeInsets.symmetric(horizontal: 16),
+                    decoration: BoxDecoration(
+                      color: Colors.grey.withValues(alpha: 0.05),
+                      borderRadius: AppTheme.mediumRadius,
+                    ),
+                    child: const Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Why use VPN?',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16,
+                          ),
+                        ),
+                        SizedBox(height: 8),
+                        Text(
+                          '• Military-grade encryption for all messages\n'
+                          '• Protection against network surveillance\n'
+                          '• Secure communication over public Wi-Fi\n'
+                          '• Bypass network restrictions\n\n'
+                          'Note: For local development, you may need to disable VPN to connect to your development server.',
+                          style: AppTheme.captionStyle,
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 24),
+
+                  // Close Button
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: ElevatedButton(
+                      onPressed: () {
+                        Navigator.pop(context);
+                      },
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: AppTheme.primaryColor,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                        shape: const RoundedRectangleBorder(
+                          borderRadius: AppTheme.mediumRadius,
+                        ),
+                      ),
+                      child: const Text('Close'),
+                    ),
+                  ),
+
+                  const SizedBox(height: 24),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: AppTheme.primaryGradient,
+        ),
+        child: SafeArea(
+          child: Column(
+            children: [
+              // Header
+              Container(
+                padding: const EdgeInsets.all(16),
+                child: Row(
+                  children: [
+                    // App Logo and Title
+                    const Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Falcon Chat',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 24,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          SizedBox(height: 4),
+                          Text(
+                            'Secure Military Messaging',
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 14,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+
+                    // VPN Status Indicator
+                    _buildVpnStatusIndicator(),
+
+                    const SizedBox(width: 12),
+
+                    // Menu Button
+                    Container(
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.2),
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: IconButton(
+                        icon: const Icon(
+                          Icons.menu,
+                          color: Colors.white,
+                        ),
+                        onPressed: _showMenuOptions,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+              // Search Bar
+              _buildSearchBar(),
+
+              // Session Status
+              SessionStatusWidget(
+                child: Container(), // Empty container as placeholder
+              ),
+
+              // Conversation List
+              Expanded(
+                child: _buildConversationList(),
+              ),
+            ],
+          ),
+        ),
+      ),
+      floatingActionButton: AnimatedFAB(
+        onNewChat: _onNewChat,
+        onNewGroup: _onNewGroup,
+        onSecureCall: _onSecureCall,
+      ),
+    );
+  }
+
+  void _onNewChat() {
+    // Navigate to contacts screen to select a contact
+    Navigator.pushNamed(context, '/contacts');
+  }
+
+  void _onNewGroup() {
+    // Show group creation dialog
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Create New Group'),
+          content: const Text(
+              'Group creation functionality would be implemented here'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text(
+                        'Group creation functionality would be implemented here'),
+                    backgroundColor: AppTheme.primaryColor,
+                  ),
+                );
+              },
+              child: const Text('Create'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _onSecureCall() {
+    // Show secure call dialog
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Secure Call'),
+          content: const Text(
+              'Secure calling functionality would be implemented here'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text(
+                        'Secure calling functionality would be implemented here'),
+                    backgroundColor: AppTheme.primaryColor,
+                  ),
+                );
+              },
+              child: const Text('Call'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildVpnStatusIndicator() {
+    return Consumer<VpnService>(
+      builder: (context, vpnService, child) {
+        return GestureDetector(
+          onTap: () {
+            _showVpnSettings();
+          },
+          child: TweenAnimationBuilder<double>(
+            duration: const Duration(milliseconds: 300),
+            tween: Tween(begin: 0.0, end: vpnService.isConnected ? 1.0 : 0.0),
+            curve: Curves.easeInOut,
+            builder: (context, value, child) {
+              return Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                  color: Color.lerp(
+                    AppTheme.errorColor, // Red when disconnected
+                    AppTheme.successColor, // Green when connected
+                    value,
+                  ),
+                  borderRadius: BorderRadius.circular(20),
+                  boxShadow: [
+                    BoxShadow(
+                      color: (Color.lerp(
+                        AppTheme.errorColor,
+                        AppTheme.successColor,
+                        value,
+                      )!)
+                          .withValues(alpha: 0.3),
+                      blurRadius: 8,
+                      offset: const Offset(0, 2),
+                    ),
+                  ],
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      vpnService.isConnected ? Icons.lock : Icons.lock_open,
+                      color: Colors.white,
+                      size: 16,
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      vpnService.isConnected ? 'Secure' : 'Not Secure',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildSearchBar() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: TextField(
+        controller: _searchController,
+        onChanged: (value) {
+          if (value.trim().isEmpty) {
+            setState(() {
+              _isSearching = false;
+              _searchResults = [];
+            });
+          } else {
+            setState(() {
+              _isSearching = true;
+            });
+            // Use debounced search
+            _searchUsers(value);
+          }
+        },
+        decoration: InputDecoration(
+          labelText: 'Search conversations or find new contacts...',
+          labelStyle: const TextStyle(
+            color: AppTheme.greyColor,
+            fontSize: 14,
+          ),
+          hintText: 'Type a name or phone number...',
+          hintStyle: const TextStyle(
+            color: AppTheme.greyColor,
+            fontSize: 14,
+          ),
+          prefixIcon: const Icon(
+            Icons.search,
+            color: AppTheme.primaryColor,
+          ),
+          suffixIcon: _isSearching
+              ? IconButton(
+                  icon: const Icon(
+                    Icons.close,
+                    color: AppTheme.greyColor,
+                  ),
+                  onPressed: () {
+                    setState(() {
+                      _isSearching = false;
+                      _searchController.clear();
+                      _searchResults = [];
+                    });
+                  },
+                )
+              : null,
+          floatingLabelBehavior: FloatingLabelBehavior.auto,
+          filled: true,
+          fillColor: Colors.white,
+          border: OutlineInputBorder(
+            borderRadius: AppTheme.mediumRadius,
+            borderSide:
+                BorderSide(color: AppTheme.greyColor.withValues(alpha: 0.3)),
+          ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: AppTheme.mediumRadius,
+            borderSide:
+                BorderSide(color: AppTheme.greyColor.withValues(alpha: 0.3)),
+          ),
+          focusedBorder: const OutlineInputBorder(
+            borderRadius: AppTheme.mediumRadius,
+            borderSide: BorderSide(color: AppTheme.primaryColor, width: 2),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildConversationList() {
+    debugPrint(
+        'Building conversation list with ${_conversations.length} conversations');
+
+    if (_isLoading) {
+      debugPrint('Showing loading indicator');
+      return _buildShimmerLoadingList();
+    }
+
+    if (_conversations.isEmpty) {
+      debugPrint('Showing empty state');
+      return _buildEmptyState();
+    }
+
+    debugPrint('Building list with ${_conversations.length} items');
+    return RefreshIndicator(
+      onRefresh: _loadConversations,
+      child: AnimatedBuilder(
+        animation: _animationController,
+        builder: (context, child) {
+          return FadeTransition(
+            opacity: _fadeAnimation,
+            child: ListView.builder(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              itemCount: _conversations.length,
+              itemBuilder: (context, index) {
+                final conversation = _conversations[index];
+                debugPrint(
+                    'Building conversation item $index: ${conversation['name']}');
+
+                return _buildConversationItem(conversation, index);
+              },
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildConversationItem(Map<String, dynamic> conversation, int index) {
+    return AnimatedWidgets.animatedListItem(
+      index: index,
+      onTap: () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (context) => ChatScreen(
+              recipientId: conversation['id']?.toString() ?? '',
+              recipientName: conversation['name']?.toString() ?? 'Unknown',
+            ),
+          ),
+        );
+      },
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 8),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: AppTheme.mediumRadius,
+          boxShadow: AppTheme.softShadow,
+        ),
+        clipBehavior: Clip.hardEdge,
+        child: ListTile(
+          contentPadding: const EdgeInsets.all(16),
+          leading: Stack(
+            children: [
+              // Profile picture with gradient background
+              Container(
+                width: 50,
+                height: 50,
+                decoration: BoxDecoration(
+                  gradient: AppTheme.primaryGradient,
+                  shape: BoxShape.circle,
+                ),
+                child: Center(
+                  child: Text(
+                    conversation['avatar']?.toString() ??
+                        (conversation['name']?.toString().isNotEmpty == true
+                            ? conversation['name']![0].toUpperCase()
+                            : 'U'),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ),
+              // Online status indicator
+              if (conversation['isOnline'] == true)
+                Positioned(
+                  right: 2,
+                  bottom: 2,
+                  child: Container(
+                    width: 14,
+                    height: 14,
+                    decoration: BoxDecoration(
+                      color: Colors.green,
+                      shape: BoxShape.circle,
+                      border: Border.all(color: Colors.white, width: 2),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          title: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  conversation['name']?.toString() ?? 'Unknown',
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w600,
+                    fontSize: 16,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              if (conversation['lastMessage'] != null)
+                Text(
+                  _formatTime(
+                      conversation['lastMessage']['timestamp']?.toString() ??
+                          ''),
+                  style: AppTheme.captionStyle.copyWith(fontSize: 12),
+                ),
+            ],
+          ),
+          subtitle: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const SizedBox(height: 2),
+              Text(
+                conversation['status']?.toString() ?? 'Available',
+                style: AppTheme.captionStyle.copyWith(
+                  fontSize: 12,
+                  color: Colors.green,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              if (conversation['lastMessage'] != null) ...[
+                const SizedBox(height: 2),
+                Row(
+                  children: [
+                    const SizedBox(width: 0),
+                    Expanded(
+                      child: Text(
+                        conversation['lastMessage']['message']?.toString() ??
+                            '',
+                        style: AppTheme.captionStyle.copyWith(
+                          fontSize: 13,
+                          color: AppTheme.greyColor,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ],
+          ),
+          trailing: _buildUnreadBadge(conversation),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildUnreadBadge(Map<String, dynamic> conversation) {
+    if (conversation['unreadCount'] is int && conversation['unreadCount'] > 0) {
+      return TweenAnimationBuilder<double>(
+        duration: const Duration(milliseconds: 500),
+        tween: Tween(begin: 0.0, end: 1.0),
+        curve: Curves.elasticOut,
+        builder: (context, scale, child) {
+          return Transform.scale(
+            scale: scale,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                gradient: AppTheme.primaryGradient,
+                borderRadius: BorderRadius.circular(12),
+                boxShadow: [
+                  BoxShadow(
+                    color: AppTheme.primaryColor.withValues(alpha: 0.3),
+                    blurRadius: 8,
+                    offset: const Offset(0, 2),
+                  ),
+                ],
+              ),
+              child: Text(
+                conversation['unreadCount'].toString(),
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          );
+        },
+      );
+    } else {
+      return const Icon(Icons.chevron_right, color: AppTheme.greyColor);
+    }
+  }
+
+  Widget _buildShimmerLoadingList() {
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      itemCount: 10,
+      itemBuilder: (context, index) {
+        return AnimatedWidgets.shimmerLoading(
+          isLoading: true,
+          child: Container(
+            margin: const EdgeInsets.only(bottom: 8),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: AppTheme.mediumRadius,
+            ),
+            clipBehavior: Clip.hardEdge,
+            child: ListTile(
+              contentPadding: const EdgeInsets.all(16),
+              leading: Container(
+                width: 50,
+                height: 50,
+                decoration: BoxDecoration(
+                  color: Colors.grey[300],
+                  shape: BoxShape.circle,
+                ),
+              ),
+              title: Container(
+                height: 16,
+                width: 100,
+                color: Colors.grey[300],
+              ),
+              subtitle: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const SizedBox(height: 8),
+                  Container(
+                    height: 12,
+                    width: 150,
+                    color: Colors.grey[300],
+                  ),
+                ],
+              ),
+              trailing: Container(
+                width: 24,
+                height: 24,
+                decoration: BoxDecoration(
+                  color: Colors.grey[300],
+                  shape: BoxShape.circle,
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildEmptyState() {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(
+            Icons.chat_bubble_outline,
+            size: 80,
+            color: AppTheme.greyColor.withValues(alpha: 0.5),
+          ),
+          const SizedBox(height: 16),
+          const Text(
+            'No conversations yet',
+            style: AppTheme.headingStyle,
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Start chatting with secure contacts',
+            style: AppTheme.captionStyle,
+          ),
+          const SizedBox(height: 24),
+          ElevatedButton(
+            onPressed: _loadConversations,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppTheme.primaryColor,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+              shape: const RoundedRectangleBorder(
+                borderRadius: AppTheme.mediumRadius,
+              ),
+            ),
+            child: const Text('Refresh Conversations'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    _animationController.dispose();
+    // Cancel timers
+    _refreshTimer?.cancel();
+    _searchDebounceTimer?.cancel();
+    // Remove listener from chat service
+    _chatService.removeListener(_handleChatServiceUpdate);
+    super.dispose();
+  }
+}
